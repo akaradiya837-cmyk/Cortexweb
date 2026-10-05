@@ -194,7 +194,10 @@ async function api(req, res, session, pathname) {
       const { name, email, workspace, projectName, projectType, brief, passwordHash } = pending.user;
       const [userResult] = await connection.execute('INSERT INTO users (name, email, password_hash, workspace) VALUES (?, ?, ?, ?)', [name, email, passwordHash, workspace]);
       const userId = Number(userResult.insertId);
-      const [projectResult] = await connection.execute('INSERT INTO projects (user_id, name, client, type, brief) VALUES (?, ?, ?, ?, ?)', [userId, projectName, name, projectType, brief]);
+      const [projectResult] = await connection.execute(
+  'INSERT INTO projects (user_id, name, client, type, brief, content_json) VALUES (?, ?, ?, ?, ?, ?)',
+  [userId, projectName, name, projectType, brief, '{}']
+);
       await logActivity(userId, Number(projectResult.insertId), 'Project created', `${projectName} · workspace created`, connection);
       await connection.commit();
       session.userId = userId;
@@ -205,7 +208,8 @@ async function api(req, res, session, pathname) {
       await connection.rollback();
       const duplicate = error.code === 'ER_DUP_ENTRY';
       if (duplicate) delete session.pendingRegistration;
-      return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with that email already exists.' : 'Could not create the account.' });
+    console.error('Account creation error:', error);
+return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with that email already exists.' : 'Could not create the account.' });
     } finally {
       connection.release();
     }
@@ -373,14 +377,42 @@ async function requestHandler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
   try {
-    if (pathname.startsWith('/api/')) return await api(req, res, session, pathname);
     if (pathname.startsWith('/site/')) {
-      const [rows] = await db.execute('SELECT id FROM projects WHERE slug = ? AND status = ?', [pathname.slice(6), 'Published']);
-      if (!rows[0]) return json(res, 404, { error: 'Website not found.' });
-      const filePath = path.join(root, 'index.html');
-      res.writeHead(200, { 'content-type': mimeTypes['.html'] });
-      return fs.createReadStream(filePath).pipe(res);
-    }
+  const sitePath = pathname.slice(6);
+  const parts = sitePath.split('/');
+
+  // /site/<slug> -> published website
+  if (parts.length === 1) {
+    const [rows] = await db.execute(
+      'SELECT id FROM projects WHERE slug = ? AND status = ?',
+      [parts[0], 'Published']
+    );
+
+    if (!rows[0]) return json(res, 404, { error: 'Website not found.' });
+
+    const filePath = path.join(root, 'index.html');
+    res.writeHead(200, { 'content-type': mimeTypes['.html'] });
+    return fs.createReadStream(filePath).pipe(res);
+  }
+
+  // /site/<slug>/<asset> -> serve CSS, JS, images, etc.
+  const assetPath = parts.slice(1).join('/');
+  const filePath = path.resolve(root, assetPath);
+
+  if (
+    (filePath !== root && !filePath.startsWith(`${root}${path.sep}`)) ||
+    !fs.existsSync(filePath) ||
+    fs.statSync(filePath).isDirectory()
+  ) {
+    return json(res, 404, { error: 'Not found.' });
+  }
+
+  res.writeHead(200, {
+    'content-type': mimeTypes[path.extname(filePath)] || 'application/octet-stream'
+  });
+
+  return fs.createReadStream(filePath).pipe(res);
+}
     const filePath = path.resolve(root, pathname === '/' ? 'index.html' : `.${pathname}`);
     if ((filePath !== root && !filePath.startsWith(`${root}${path.sep}`)) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return json(res, 404, { error: 'Not found.' });
     res.writeHead(200, { 'content-type': mimeTypes[path.extname(filePath)] || 'application/octet-stream' });
