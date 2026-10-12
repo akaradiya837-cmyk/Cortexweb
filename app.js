@@ -499,16 +499,6 @@ function applyRole(user) {
   if (!userProject) { const initials = (normalizedUser.name || 'User').split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase(); userProject = { id: Date.now(), name: 'My first website', client: normalizedUser.name || 'Website owner', type: 'Marketing website', status: 'In progress', initials, color: 'purple', updated: 'Just now', brief: 'Your starter website is ready to customize.' }; projects = [userProject]; save(); renderAll(); }
   openBuilder(userProject.id);
 }
-function switchAuthView(view) {
-  const tabs = $$('.auth-tab');
-  const login = $('#loginForm');
-  const register = $('#registerForm');
-  const isLogin = view === 'login';
-  tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.authView === view));
-  login.classList.toggle('visible', isLogin);
-  register.classList.toggle('visible', !isLogin);
-}
-
 let registrationAwaitingOtp = false;
 let pendingRegistrationData = null;
 async function sendRegistrationOtp(data) {
@@ -542,18 +532,8 @@ $('#registerForm').addEventListener('submit', async (event) => {
     applyRole(backendUser);
     showToast('Email verified. Your workspace is ready.');
   } catch (error) {
-    if (!backendEnabled && !registrationAwaitingOtp && error.message === 'Backend unavailable.') {
-      const passwordHash = await hashPassword(data.password);
-      if (!passwordHash) { showAuthError('Secure password storage requires a secure browser context.'); return; }
-      const user = { name: data.name, email: data.email, workspace: data.workspace, projectName: data.projectName, projectType: data.projectType, passwordHash, role: 'user' };
-      localStorage.setItem('cortexweb_user', JSON.stringify(user));
-      const initials = user.name.split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase();
-      projects = [{ id: Date.now(), name: user.projectName, client: user.name, type: user.projectType, status: 'In progress', initials, color: 'purple', updated: 'Just now', brief: 'Your first CortexWeb project is ready. Add sections, edit the copy, and publish when it feels right.' }];
-      activity = [{ icon: '✦', title: 'Workspace created', detail: `${user.projectName} · ready to build`, time: 'Just now' }];
-      save(); renderAll(); switchAuthView('login');
-      $('#loginForm input[name="email"]').value = user.email;
-      $('#loginForm input[name="password"]').value = '';
-      showToast('Account created. Please log in to continue.');
+    if (error.message === 'Backend unavailable.') {
+      showAuthError('Email verification is unavailable because the server could not be reached. Please try again later.');
       return;
     }
     showAuthError(error.message);

@@ -29,6 +29,8 @@ npm start
 
 Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASSWORD`, and `SMTP_FROM` in `.env` with your mail provider's SMTP details. Port 587 with `SMTP_SECURE=false` is typical for STARTTLS; port 465 generally uses `SMTP_SECURE=true`. Open `http://localhost:3000`, create an account, verify the emailed code, choose a template, add a contact form, and publish. The server creates the required InnoDB tables in the configured database on first start. Keep `.env` private.
 
+In production, route the frontend's same-origin `/api` requests to this Node server and configure working SMTP settings. If the API or email service is unavailable, registration will show an error and will not create an unverified browser-only account.
+
 ### Import existing SQLite data
 
 The importer preserves IDs, timestamps, and foreign-key relationships. It never deletes or modifies the SQLite file and refuses to import into a MySQL database that already contains application records.
