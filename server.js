@@ -9,7 +9,7 @@ const envFile = path.join(root, '.env');
 if (fs.existsSync(envFile)) process.loadEnvFile(envFile);
 
 const { createPool, initializeSchema } = require('./database');
-const db = createPool();
+let db;
 const port = Number(process.env.PORT || 3000);
 const sessions = new Map();
 const otpSentAtByEmail = new Map();
@@ -46,8 +46,19 @@ function validateContent(content) {
   if (content === undefined) return null;
   if (!content || typeof content !== 'object' || Array.isArray(content)) return { error: 'Website content must be an object.' };
   if (JSON.stringify(content).length > 1500000) return { error: 'Website content is too large.' };
-  if (content.builderPages && (!Array.isArray(content.builderPages) || content.builderPages.length > 20 || content.builderPages.some((page) => !page || typeof page.name !== 'string' || !Array.isArray(page.sections) || page.sections.length > 100))) return { error: 'Website pages or sections are invalid.' };
+  if (content.builderPages !== undefined && (!Array.isArray(content.builderPages) || content.builderPages.length < 1 || content.builderPages.length > 20 || content.builderPages.some((page) => !page || typeof page.name !== 'string' || !page.name.trim() || !Array.isArray(page.sections) || page.sections.length > 100))) return { error: 'Website pages or sections are invalid.' };
+  if (content.builderSections !== undefined && (!Array.isArray(content.builderSections) || content.builderSections.length > 100)) return { error: 'Website pages or sections are invalid.' };
   return null;
+}
+
+function contentHasSections(content) {
+  return Boolean(
+    content &&
+    (
+      (Array.isArray(content.builderPages) && content.builderPages.some((page) => Array.isArray(page?.sections) && page.sections.length > 0)) ||
+      (Array.isArray(content.builderSections) && content.builderSections.length > 0)
+    )
+  );
 }
 
 const parseCookies = (header = '') => Object.fromEntries(header.split(';').map((part) => part.trim().split('=').map(decodeURIComponent)).filter((part) => part.length === 2));
@@ -103,12 +114,13 @@ function requireCsrf(req, session, res) {
   return true;
 }
 
-async function ownedProject(id, userId) {
-  const [rows] = await db.execute('SELECT * FROM projects WHERE id = ? AND user_id = ?', [Number(id), userId]);
+async function ownedProject(id, userId, executor = db) {
+  const [rows] = await executor.execute('SELECT * FROM projects WHERE id = ? AND user_id = ?', [Number(id), userId]);
   return rows[0];
 }
 
-async function api(req, res, session, pathname) {
+async function api(req, res, session, pathname, database = db) {
+  const db = database;
   if (pathname === '/api/csrf' && req.method === 'GET') return json(res, 200, { csrfToken: session.csrf });
   if (!requireCsrf(req, session, res)) return;
 
@@ -256,7 +268,7 @@ return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with th
     const contentError = validateContent(body.content);
     if (input.error || contentError) return json(res, 422, { error: input.error || contentError.error });
     const [result] = await db.execute('INSERT INTO projects (user_id, name, client, type, brief, content_json) VALUES (?, ?, ?, ?, ?, ?)', [session.userId, input.name, input.client, input.type, input.brief, JSON.stringify(body.content || {})]);
-    await logActivity(session.userId, Number(result.insertId), 'Project created', input.name);
+    await logActivity(session.userId, Number(result.insertId), 'Project created', input.name, db);
     const [rows] = await db.execute('SELECT * FROM projects WHERE id = ?', [result.insertId]);
     return json(res, 201, { project: projectView(rows[0]) });
   }
@@ -264,7 +276,7 @@ return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with th
   const projectMatch = pathname.match(/^\/api\/projects\/(\d+)(?:\/(publish|unpublish))?$/);
   if (projectMatch) {
     if (!requireUser(session, res)) return;
-    const project = await ownedProject(projectMatch[1], session.userId);
+    const project = await ownedProject(projectMatch[1], session.userId, db);
     if (!project) return json(res, 404, { error: 'Project not found.' });
     const action = projectMatch[2];
 
@@ -278,14 +290,14 @@ return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with th
         slug = `${base}-${suffix++}`;
       }
       await db.execute('UPDATE projects SET slug = ?, status = ?, published_at = CURRENT_TIMESTAMP WHERE id = ?', [slug, 'Published', project.id]);
-      await logActivity(session.userId, Number(project.id), 'Website published', `/site/${slug}`);
+      await logActivity(session.userId, Number(project.id), 'Website published', `/site/${slug}`, db);
       const [rows] = await db.execute('SELECT * FROM projects WHERE id = ?', [project.id]);
       return json(res, 200, { project: projectView(rows[0]), publicUrl: `/site/${slug}` });
     }
 
     if (action === 'unpublish' && req.method === 'POST') {
       await db.execute('UPDATE projects SET status = ?, published_at = NULL WHERE id = ?', ['Draft', project.id]);
-      await logActivity(session.userId, Number(project.id), 'Website unpublished', project.name);
+      await logActivity(session.userId, Number(project.id), 'Website unpublished', project.name, db);
       const [rows] = await db.execute('SELECT * FROM projects WHERE id = ?', [project.id]);
       return json(res, 200, { project: projectView(rows[0]) });
     }
@@ -295,15 +307,44 @@ return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with th
       const contentError = validateContent(body.content);
       if (contentError) return json(res, 422, { error: contentError.error });
       const status = ['Draft', 'Published', 'Archived'].includes(body.status) ? body.status : project.status;
-      await db.execute('UPDATE projects SET name = COALESCE(?, name), client = COALESCE(?, client), type = COALESCE(?, type), brief = COALESCE(?, brief), content_json = COALESCE(?, content_json), status = ? WHERE id = ?', [body.name ? String(body.name).slice(0, 100) : null, body.client ? String(body.client).slice(0, 80) : null, body.type ? String(body.type).slice(0, 40) : null, body.brief === undefined ? null : String(body.brief).slice(0, 2000), body.content === undefined ? null : JSON.stringify(body.content), status, project.id]);
-      await logActivity(session.userId, Number(project.id), 'Project updated', body.name || project.name);
+      const connection = await db.getConnection();
+      let transactionOpen = false;
+      try {
+        await connection.beginTransaction();
+        transactionOpen = true;
+        const [lockedRows] = await connection.execute('SELECT content_json FROM projects WHERE id = ? AND user_id = ? FOR UPDATE', [project.id, session.userId]);
+        if (!lockedRows[0]) {
+          await connection.rollback();
+          transactionOpen = false;
+          return json(res, 404, { error: 'Project not found.' });
+        }
+        const previousContent = JSON.parse(lockedRows[0].content_json || '{}');
+        const emptyDesign = body.content && (Array.isArray(body.content.builderPages) || Array.isArray(body.content.builderSections)) && !contentHasSections(body.content);
+        if (emptyDesign && contentHasSections(previousContent) && body.confirmEmptyContent !== true) {
+          await connection.rollback();
+          transactionOpen = false;
+          return json(res, 409, {
+            code: 'EMPTY_CONTENT_REQUIRES_CONFIRMATION',
+            error: 'This save would remove all saved website sections. Confirm that you want to replace the existing design with an empty one.'
+          });
+        }
+        await connection.execute('UPDATE projects SET name = COALESCE(?, name), client = COALESCE(?, client), type = COALESCE(?, type), brief = COALESCE(?, brief), content_json = COALESCE(?, content_json), status = ? WHERE id = ?', [body.name ? String(body.name).slice(0, 100) : null, body.client ? String(body.client).slice(0, 80) : null, body.type ? String(body.type).slice(0, 40) : null, body.brief === undefined ? null : String(body.brief).slice(0, 2000), body.content === undefined ? null : JSON.stringify(body.content), status, project.id]);
+        await connection.commit();
+        transactionOpen = false;
+      } catch (error) {
+        if (transactionOpen) await connection.rollback();
+        throw error;
+      } finally {
+        connection.release();
+      }
+      await logActivity(session.userId, Number(project.id), 'Project updated', body.name || project.name, db);
       const [rows] = await db.execute('SELECT * FROM projects WHERE id = ?', [project.id]);
       return json(res, 200, { project: projectView(rows[0]) });
     }
 
     if (!action && req.method === 'DELETE') {
       await db.execute('DELETE FROM projects WHERE id = ?', [project.id]);
-      await logActivity(session.userId, null, 'Project deleted', project.name);
+      await logActivity(session.userId, null, 'Project deleted', project.name, db);
       return empty(res);
     }
   }
@@ -377,6 +418,7 @@ async function requestHandler(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = decodeURIComponent(url.pathname);
   try {
+    if (pathname.startsWith('/api/')) return await api(req, res, session, pathname, db);
     if (pathname.startsWith('/site/')) {
   const sitePath = pathname.slice(6);
   const parts = sitePath.split('/');
@@ -425,13 +467,16 @@ async function requestHandler(req, res) {
 
 async function startServer() {
   try {
+    db = createPool();
     await initializeSchema(db);
     http.createServer(requestHandler).listen(port, () => console.log(`CortexWeb running at http://localhost:${port} (MySQL)`));
   } catch (error) {
     console.error(`Could not start CortexWeb with MySQL: ${error.message}`);
-    await db.end();
+    await db?.end();
     process.exitCode = 1;
   }
 }
 
-startServer();
+if (require.main === module) startServer();
+
+module.exports = { api, requestHandler };
