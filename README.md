@@ -49,7 +49,7 @@ The dashboard reports actual workspace counts. There are no seeded demo accounts
 
 ## Known prototype limits
 
-- The page/section editor currently keeps some in-progress edits in browser storage; verify persistence after refresh before relying on it for a live customer site.
+- When connected to the backend, page and section edits are saved to MySQL. Standalone/offline mode uses browser storage instead; verify the save indicator and reload behavior before relying on a live customer site.
 - Public contact forms are not protected by rate limits or spam moderation.
 - No custom domains, general email notifications, password reset, payment processing, AI generation, real database integrations, or managed cloud hosting are implemented. OTP challenges are held in memory and are limited to a single server process.
 - The local server's in-memory sessions and default development secret are not production deployment settings. Use HTTPS, a persistent session store, configured secrets, backups, and operational monitoring before exposing it publicly.
@@ -58,6 +58,7 @@ The dashboard reports actual workspace counts. There are no seeded demo accounts
 ## Verification
 
 ```powershell
+npm test
 node --check .\app.js
 node --check .\server.js
 node --check .\database.js

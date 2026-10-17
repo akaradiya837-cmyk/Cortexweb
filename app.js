@@ -44,10 +44,29 @@ async function apiRequest(path, options = {}) {
   if (csrfToken && options.method && options.method !== 'GET') headers['x-csrf-token'] = csrfToken;
   const response = await fetch(path, { credentials: 'same-origin', ...options, headers });
   const payload = response.status === 204 ? null : await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload?.error || 'Request failed.');
+  if (!response.ok) {
+    const error = new Error(payload?.error || 'Request failed.');
+    error.status = response.status;
+    error.code = payload?.code;
+    throw error;
+  }
   return payload;
 }
-function backendProject(project) { const content = project.content || {}; return { ...project, ...content, status: project.status === 'Published' ? 'Live' : project.status === 'Archived' ? 'Archived' : 'In progress', updated: project.updated_at ? new Date(`${project.updated_at}Z`).toLocaleString() : 'Just now', initials: project.initials || project.client?.split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase(), color: project.color || 'purple', publishedUrl: project.slug ? `${location.origin}/site/${encodeURIComponent(project.slug)}` : project.publishedUrl }; }
+function normalizedBuilderPages(project) {
+  let pages = Array.isArray(project.builderPages) ? project.builderPages : [];
+  if (!pages.length && Array.isArray(project.builderSections) && project.builderSections.length) pages = [{ name: 'Home', sections: project.builderSections }];
+  pages = pages.filter((page) => page && typeof page === 'object' && !Array.isArray(page)).map((page, index) => ({
+    name: typeof page.name === 'string' && page.name.trim() ? page.name : `Page ${index + 1}`,
+    sections: Array.isArray(page.sections) ? page.sections : []
+  }));
+  return pages.length ? pages : [{ name: 'Home', sections: [] }];
+}
+function backendProject(project) {
+  const content = project.content || {};
+  const merged = { ...project, ...content };
+  const builderPages = normalizedBuilderPages(merged);
+  return { ...merged, builderPages, builderSections: builderPages[0].sections, status: project.status === 'Published' ? 'Live' : project.status === 'Archived' ? 'Archived' : 'In progress', updated: project.updated_at ? new Date(`${project.updated_at}Z`).toLocaleString() : 'Just now', initials: project.initials || project.client?.split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase(), color: project.color || 'purple', publishedUrl: project.slug ? `${location.origin}/site/${encodeURIComponent(project.slug)}` : project.publishedUrl };
+}
 function sanitizeStorageValue(value, maxImageLength = 140000) {
   if (typeof value === 'string') {
     if (value.startsWith('data:image/')) return value.length > maxImageLength ? '' : value;
@@ -89,11 +108,152 @@ function safeStorageSet(key, value) {
     }
   }
 }
-let saveTimer = null;
-function queueBackendSave() { if (!backendEnabled || !activeProject) return; clearTimeout(saveTimer); saveTimer = setTimeout(async () => { try { setSaveState('Saving...'); await apiRequest(`/api/projects/${activeProject.id}`, { method: 'PUT', body: JSON.stringify({ name: activeProject.name, client: activeProject.client, type: activeProject.type, brief: activeProject.brief, content: { builderPages: activeProject.builderPages, builderTheme: activeProject.builderTheme, siteSettings: activeProject.siteSettings } }) }); setSaveState('Saved'); } catch { setSaveState('Save failed'); } }, 450); }
+const saveTimers = new Map();
+const backendSavePromises = new Map();
+const saveGenerations = new Map();
+function projectSaveSnapshot(project) {
+  return JSON.parse(JSON.stringify({
+    id: project.id,
+    name: project.name,
+    client: project.client,
+    type: project.type,
+    brief: project.brief,
+    builderPages: normalizedBuilderPages(project),
+    builderTheme: project.builderTheme,
+    siteSettings: project.siteSettings
+  }));
+}
+async function sendBackendSave(project, confirmEmptyContent = false, generation) {
+  const payload = {
+    name: project.name,
+    client: project.client,
+    type: project.type,
+    brief: project.brief,
+    content: { builderPages: project.builderPages, builderTheme: project.builderTheme, siteSettings: project.siteSettings },
+    ...(confirmEmptyContent ? { confirmEmptyContent: true } : {})
+  };
+  const previousSave = backendSavePromises.get(project.id) || Promise.resolve();
+  const pendingSave = previousSave.catch(() => {}).then(async () => {
+    if (generation !== undefined && generation !== saveGenerations.get(project.id)) return false;
+    await apiRequest(`/api/projects/${project.id}`, { method: 'PUT', body: JSON.stringify(payload) });
+    return true;
+  });
+  backendSavePromises.set(project.id, pendingSave);
+  try {
+    await pendingSave;
+  } finally {
+    if (backendSavePromises.get(project.id) === pendingSave) backendSavePromises.delete(project.id);
+  }
+}
+async function saveBackendProject(project, generation) {
+  try {
+    return await sendBackendSave(project, false, generation);
+  } catch (error) {
+    if (error.code !== 'EMPTY_CONTENT_REQUIRES_CONFIRMATION') throw error;
+    const outcome = await CortexWebSaveRecovery.handleEmptySaveConfirmation({
+      confirmReplacement: () => window.confirm('This editor is empty, but the server has a saved design. Replace that saved design with an empty website? Choose Cancel to keep the saved design and reload it.'),
+      replaceWithEmpty: () => sendBackendSave(project, true, generation),
+      reloadSavedProject: async () => {
+        try {
+          await reloadSavedProject(project.id);
+        } catch (reloadError) {
+          reloadError.recoveryFailure = true;
+          throw reloadError;
+        }
+      }
+    });
+    return outcome === 'replaced';
+  }
+}
+async function reloadSavedProject(projectId) {
+  const timer = saveTimers.get(projectId);
+  if (timer) clearTimeout(timer);
+  saveTimers.delete(projectId);
+  saveGenerations.set(projectId, (saveGenerations.get(projectId) || 0) + 1);
+  while (backendSavePromises.has(projectId)) {
+    await backendSavePromises.get(projectId).catch(() => {});
+  }
+
+  const currentProjectIsBeingEdited = String(activeProject?.id) === String(projectId);
+  let pageIndex = activePageIndex;
+  let pageName;
+  if (currentProjectIsBeingEdited) pageName = activeProject.builderPages?.[activePageIndex]?.name;
+  await CortexWebSaveRecovery.loadAndApplySavedProject(
+    projectId,
+    async () => (await apiRequest('/api/projects')).projects.map(backendProject),
+    async (refreshedProject, refreshedProjects) => {
+      projects = refreshedProjects;
+      if (!currentProjectIsBeingEdited) return;
+
+      activeProject = refreshedProject;
+      const matchingPageIndex = pageName ? refreshedProject.builderPages.findIndex((page) => page.name === pageName) : -1;
+      activePageIndex = matchingPageIndex >= 0
+        ? matchingPageIndex
+        : Math.min(pageIndex, refreshedProject.builderPages.length - 1);
+      selectedSection = null;
+      $('#inspectorForm').classList.remove('visible');
+      $('#inspectorEmpty').style.display = 'block';
+      $('#builderTitle').textContent = refreshedProject.name;
+      $('#builderProjectLabel').textContent = refreshedProject.name;
+      $('#builderTypeLabel').textContent = refreshedProject.type;
+      $('#siteTitle').value = refreshedProject.siteSettings?.title || refreshedProject.name;
+      $('#siteDescription').value = refreshedProject.siteSettings?.description || refreshedProject.brief || '';
+      $('#siteAccent').value = refreshedProject.siteSettings?.accent || '#d8f36b';
+      $('#canvasSlug').textContent = refreshedProject.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'your-site';
+      renderAll();
+      renderPageTabs();
+      renderCanvas();
+    }
+  );
+  setSaveState('Saved');
+}
+function queueBackendSave() {
+  if (!backendEnabled || !activeProject || document.body.classList.contains('public-mode')) return;
+  const project = projectSaveSnapshot(activeProject);
+  const generation = (saveGenerations.get(project.id) || 0) + 1;
+  saveGenerations.set(project.id, generation);
+  const existingTimer = saveTimers.get(project.id);
+  if (existingTimer) clearTimeout(existingTimer);
+  const timer = setTimeout(async () => {
+    if (saveTimers.get(project.id) !== timer || saveGenerations.get(project.id) !== generation) return;
+    saveTimers.delete(project.id);
+    if (activeProject?.id === project.id) setSaveState('Saving...');
+    try {
+      const saved = await saveBackendProject(project, generation);
+      if (activeProject?.id === project.id) setSaveState(saved ? 'Saved' : 'Save protected');
+    } catch (error) {
+      console.error(error.recoveryFailure
+        ? `[CortexWeb] Failed to reload project ${project.id} after rejecting an empty save.`
+        : `[CortexWeb] Failed to save project ${project.id}.`, error);
+      if (activeProject?.id === project.id) setSaveState(error.recoveryFailure ? 'Reload failed' : 'Save failed');
+      showToast(`${error.recoveryFailure ? 'Could not reload the saved project' : 'Could not save this project'}: ${error.message}`);
+    }
+  }, 450);
+  saveTimers.set(project.id, timer);
+}
 function setSaveState(value) { const state = $('.save-state'); if (state) state.textContent = `● ${value}`; }
-function save() { if (!backendEnabled) { safeStorageSet('cortexweb_projects', projects); safeStorageSet('cortexweb_connections', connections); safeStorageSet('cortexweb_activity', activity); } queueBackendSave(); }
-async function hydrateBackend() { const result = await apiRequest('/api/projects'); projects = result.projects.map(backendProject); const [activityResult, integrationsResult, submissionsResult] = await Promise.all([apiRequest('/api/activity'), apiRequest('/api/integrations'), apiRequest('/api/submissions')]); activity = activityResult.activity.map((item) => ({ icon: '•', title: item.action, detail: item.detail, time: item.created_at })); connections = integrationsResult.integrations.map((item) => ({ ...item, project: projects.find((project) => project.id === item.project_id)?.name || 'Project', status: item.status })); submissions = submissionsResult.submissions; renderAll(); }
+function save() { if (document.body.classList.contains('public-mode')) return; if (!backendEnabled) { safeStorageSet('cortexweb_projects', projects); safeStorageSet('cortexweb_connections', connections); safeStorageSet('cortexweb_activity', activity); } queueBackendSave(); }
+async function hydrateBackend() {
+  let projectResult;
+  try {
+    projectResult = await apiRequest('/api/projects');
+  } catch (error) {
+    console.error('[CortexWeb] Failed to load projects from the backend.', error);
+    throw error;
+  }
+  try {
+    const loadedProjects = projectResult.projects.map(backendProject);
+    const [activityResult, integrationsResult, submissionsResult] = await Promise.all([apiRequest('/api/activity'), apiRequest('/api/integrations'), apiRequest('/api/submissions')]);
+    projects = loadedProjects;
+    activity = activityResult.activity.map((item) => ({ icon: '•', title: item.action, detail: item.detail, time: item.created_at }));
+    connections = integrationsResult.integrations.map((item) => ({ ...item, project: projects.find((project) => project.id === item.project_id)?.name || 'Project', status: item.status }));
+    submissions = submissionsResult.submissions;
+    renderAll();
+  } catch (error) {
+    console.error('[CortexWeb] Failed to hydrate workspace data.', error);
+    throw error;
+  }
+}
 function showToast(message) { $('#toastMessage').textContent = message; $('#toast').classList.add('show'); setTimeout(() => $('#toast').classList.remove('show'), 2600); }
 function clearFieldErrors(form) { form?.querySelectorAll('.field-error').forEach((note) => note.remove()); form?.querySelectorAll('.input-error').forEach((field) => field.classList.remove('input-error')); }
 function showFieldError(field, message) { if (!field) return; field.classList.add('input-error'); const note = document.createElement('p'); note.className = 'field-error'; note.textContent = message; field.insertAdjacentElement('afterend', note); }
@@ -258,6 +418,10 @@ let activePageIndex = 0;
 function openBuilder(projectId) {
   activeProject = projects.find((project) => project.id === projectId) || projects[0];
   if (!activeProject) { showToast('Create a project before opening the builder.'); return; }
+  activePageIndex = 0;
+  selectedSection = null;
+  activeProject.builderPages = normalizedBuilderPages(activeProject);
+  activeProject.builderSections = activeProject.builderPages[0].sections;
   addProfilePage();
   addExportControls();
   addSiteSettings();
@@ -327,7 +491,12 @@ function applyTheme(themeId) {
   activeProject.builderPages = theme.pages.map(([name, types]) => ({ name, sections: types.map((type) => { const definition = byType(type); const isHero = type === 'hero'; return { type, order: definition.order, content: { heading: isHero ? profile.hero : definition.heading, description: isHero ? profile.heroDescription : definition.description, button: definition.button, navLinks: type === 'nav' ? ['Home', 'Products', 'Services', 'About', 'Contact'] : undefined, background: isHero ? `${profile.accent}33` : '#ffffff', textColor: '#172320', buttonColor: '#172320' } }; }) }));
   activeProject.builderSections = activeProject.builderPages[0].sections; activePageIndex = 0; selectedSection = null; $('#inspectorForm').classList.remove('visible'); $('#inspectorEmpty').style.display = 'block'; renderPageTabs(); renderCanvas(); showToast(`${theme.name} template applied with ${theme.pages.length} pages.`);
 }
-function ensurePages() { if (!activeProject.builderPages) activeProject.builderPages = [{ name: 'Home', sections: activeProject.builderSections || [] }]; activeProject.builderSections = activeProject.builderPages[activePageIndex].sections; }
+function ensurePages() {
+  if (!activeProject) return;
+  activeProject.builderPages = normalizedBuilderPages(activeProject);
+  if (!Number.isInteger(activePageIndex) || activePageIndex < 0 || activePageIndex >= activeProject.builderPages.length) activePageIndex = 0;
+  activeProject.builderSections = activeProject.builderPages[activePageIndex].sections;
+}
 function renderPageTabs() { ensurePages(); let tabs = $('#pageTabs'); if (!tabs) { $('.canvas-toolbar').insertAdjacentHTML('beforebegin', '<div id="pageTabs" class="page-tabs"></div>'); tabs = $('#pageTabs'); } tabs.innerHTML = `${activeProject.builderPages.map((page, index) => `<button class="page-tab ${index === activePageIndex ? 'active' : ''}" data-page-index="${index}" title="Double-click to rename">${page.name} <span class="rename-hint">✎</span></button>`).join('')}<button class="page-tab add-page" id="addPage">＋ Add page</button>`; $$('.page-tab[data-page-index]').forEach((tab) => { tab.addEventListener('click', () => { activePageIndex = Number(tab.dataset.pageIndex); ensurePages(); selectedSection = null; renderPageTabs(); renderCanvas(); }); tab.addEventListener('dblclick', (event) => { event.preventDefault(); renamePage(Number(tab.dataset.pageIndex)); }); }); $('#addPage').addEventListener('click', () => { const pageName = `Page ${activeProject.builderPages.length + 1}`; activeProject.builderPages.push({ name: pageName, sections: [] }); activePageIndex = activeProject.builderPages.length - 1; ensurePages(); renderPageTabs(); renderCanvas(); showToast(`${pageName} added.`); }); }
 function renamePage(index) { const currentName = activeProject.builderPages[index].name; const nextName = window.prompt('Enter a name for this page', currentName); if (!nextName || !nextName.trim()) return; activeProject.builderPages[index].name = nextName.trim().slice(0, 32); save(); renderPageTabs(); showToast('Page name updated.'); }
 function addTimesNewRomanOption() {
@@ -437,7 +606,40 @@ function renderHostedPage(pageIndex) { ensurePages(); const page = activeProject
 function bindHostedInteractions() { $('#hostedSite').querySelectorAll('.ready-form').forEach((form) => { form.noValidate = true; form.addEventListener('submit', async (event) => { event.preventDefault(); clearFormError(form); const data = Object.fromEntries(new FormData(form)); const message = data.message || 'Account form submission'; const slug = activeProject?.slug || activeProject?.publishedUrl?.match(/\/site\/([^/?]+)/)?.[1]; try { if (backendEnabled && slug) { await apiRequest(`/api/public/${encodeURIComponent(slug)}/submissions`, { method: 'POST', body: JSON.stringify({ name: data.name || 'Website visitor', email: data.email, message, formType: form.dataset.formType }) }); } form.reset(); showToast('Thanks. Your submission was received.'); } catch (error) { showFormError(form, error.message); } }); }); $('#hostedSite').querySelectorAll('.faq-lines span').forEach((item) => item.addEventListener('click', () => { item.classList.toggle('expanded'); item.querySelector('b').textContent = item.classList.contains('expanded') ? '−' : '＋'; })); $('#hostedSite').querySelectorAll('.canvas-button[href="#"]').forEach((button) => button.addEventListener('click', (event) => { event.preventDefault(); showToast('Add a destination link in the section settings.'); })); }
 function showHostedSite() { ensurePages(); renderHostedPage(activePageIndex); $('#hostedUrl').textContent = activeProject.publishedUrl; $('#hostedUrl').href = activeProject.publishedUrl; $('#hostedModal').classList.add('open'); }
 function publishedUrlFor(project) { return project.publishedUrl || `${location.origin}${location.pathname}?site=${project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')}`; }
-async function publishCurrentSite() { if (!activeProject) { showToast('Open a project before publishing.'); return; } ensurePages(); try { setSaveState('Saving...'); if (backendEnabled) { await apiRequest(`/api/projects/${activeProject.id}`, { method: 'PUT', body: JSON.stringify({ content: { builderPages: activeProject.builderPages, builderTheme: activeProject.builderTheme, siteSettings: activeProject.siteSettings } }) }); const result = await apiRequest(`/api/projects/${activeProject.id}/publish`, { method: 'POST', body: JSON.stringify({}) }); const updated = backendProject(result.project); Object.assign(activeProject, updated); activeProject.publishedUrl = `${location.origin}${result.publicUrl}`; } else { activeProject.status = 'Live'; activeProject.publishedUrl = publishedUrlFor(activeProject); activeProject.publishedAt = new Date().toISOString(); save(); } setSaveState('Saved'); $('#publishedLinkBar').classList.add('visible'); $('#editorPublishedUrl').textContent = activeProject.publishedUrl; $('#editorPublishedUrl').href = activeProject.publishedUrl; showHostedSite(); showToast(`Website updated and published at ${activeProject.publishedUrl}`); } catch (error) { setSaveState('Save failed'); showToast(error.message); } }
+async function publishCurrentSite() {
+  if (!activeProject) { showToast('Open a project before publishing.'); return; }
+  ensurePages();
+  const project = projectSaveSnapshot(activeProject);
+  try {
+    setSaveState('Saving...');
+    if (backendEnabled) {
+      const timer = saveTimers.get(project.id);
+      if (timer) clearTimeout(timer);
+      saveTimers.delete(project.id);
+      const saved = await saveBackendProject(project);
+      if (!saved) { setSaveState('Save protected'); return; }
+      const result = await apiRequest(`/api/projects/${project.id}/publish`, { method: 'POST', body: JSON.stringify({}) });
+      const updated = backendProject(result.project);
+      Object.assign(activeProject, updated);
+      activeProject.publishedUrl = `${location.origin}${result.publicUrl}`;
+    } else {
+      activeProject.status = 'Live';
+      activeProject.publishedUrl = publishedUrlFor(activeProject);
+      activeProject.publishedAt = new Date().toISOString();
+      save();
+    }
+    setSaveState('Saved');
+    $('#publishedLinkBar').classList.add('visible');
+    $('#editorPublishedUrl').textContent = activeProject.publishedUrl;
+    $('#editorPublishedUrl').href = activeProject.publishedUrl;
+    showHostedSite();
+    showToast(`Website updated and published at ${activeProject.publishedUrl}`);
+  } catch (error) {
+    console.error(`[CortexWeb] Failed to publish project ${project.id}.`, error);
+    setSaveState('Save failed');
+    showToast(error.message);
+  }
+}
 async function copyPublishedLink() { const url = activeProject?.publishedUrl; if (!url) return; try { await navigator.clipboard.writeText(url); showToast('Published link copied.'); } catch { const helper = document.createElement('textarea'); helper.value = url; document.body.appendChild(helper); helper.select(); document.execCommand('copy'); helper.remove(); showToast('Published link copied.'); } }
 $('#publishButton').addEventListener('click', publishCurrentSite);
 $('#importFile').addEventListener('change', importProjectFile);
@@ -581,16 +783,42 @@ setupAuth();
 async function initializeBackend() {
   try {
     const csrfResponse = await fetch('/api/csrf', { credentials: 'same-origin' });
-    if (!csrfResponse.ok) return;
+    if (!csrfResponse.ok) throw new Error(`Backend session initialization failed with HTTP ${csrfResponse.status}.`);
     csrfToken = (await csrfResponse.json()).csrfToken;
     const session = await apiRequest('/api/me');
     backendEnabled = true;
     if (session.user) { backendUser = session.user; await hydrateBackend(); $('.auth-gate').classList.add('hidden'); applyRole(backendUser); }
-  } catch { backendEnabled = false; }
+  } catch (error) {
+    backendEnabled = false;
+    console.error('[CortexWeb] Backend initialization failed.', error);
+  }
 }
 initializeBackend();
 const storedUser = JSON.parse(localStorage.getItem('cortexweb_user') || 'null');
 const publishedSlug = new URLSearchParams(location.search).get('site') || location.pathname.match(/^\/site\/([^/]+)$/)?.[1];
-async function initializePublicSite() { if (!publishedSlug) return; try { const result = await apiRequest(`/api/public/${encodeURIComponent(publishedSlug)}`); const publishedProject = backendProject(result.website); projects = [publishedProject]; activeProject = publishedProject; document.body.classList.remove('user-mode'); document.body.classList.add('public-mode'); $('.auth-gate').classList.add('hidden'); openBuilder(publishedProject.id); showHostedSite(); } catch { const publishedProject = projects.find((project) => project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') === publishedSlug); if (publishedProject) { document.body.classList.remove('user-mode'); document.body.classList.add('public-mode'); $('.auth-gate').classList.add('hidden'); openBuilder(publishedProject.id); showHostedSite(); } } }
+async function initializePublicSite() {
+  if (!publishedSlug) return;
+  try {
+    const result = await apiRequest(`/api/public/${encodeURIComponent(publishedSlug)}`);
+    const publishedProject = backendProject(result.website);
+    projects = [publishedProject];
+    activeProject = publishedProject;
+    document.body.classList.remove('user-mode');
+    document.body.classList.add('public-mode');
+    $('.auth-gate').classList.add('hidden');
+    openBuilder(publishedProject.id);
+    showHostedSite();
+  } catch (error) {
+    console.error(`[CortexWeb] Failed to load published website "${publishedSlug}".`, error);
+    const publishedProject = projects.find((project) => project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') === publishedSlug);
+    if (publishedProject) {
+      document.body.classList.remove('user-mode');
+      document.body.classList.add('public-mode');
+      $('.auth-gate').classList.add('hidden');
+      openBuilder(publishedProject.id);
+      showHostedSite();
+    }
+  }
+}
 initializePublicSite();
 window.addEventListener('storage', (event) => { if (!document.body.classList.contains('public-mode') || event.key !== 'cortexweb_projects') return; projects = JSON.parse(event.newValue || '[]'); const latest = projects.find((project) => project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') === publishedSlug); if (latest) { activeProject = latest; activePageIndex = 0; showHostedSite(); } });
