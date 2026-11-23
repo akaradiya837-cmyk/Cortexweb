@@ -3,6 +3,21 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const nodemailer = require('nodemailer');
+const {
+  createExternalPool,
+  createManagedPool,
+  createTableSql,
+  decryptCredentials,
+  encryptCredentials,
+  exportSql,
+  importSql,
+  parseSqlExport,
+  quoteIdentifier,
+  validIdentifier,
+  validateColumns,
+  validateRow,
+  hostedMySqlConnectionOptions,
+} = require('./workspace-database');
 
 const root = __dirname;
 const envFile = path.join(root, '.env');
@@ -117,6 +132,40 @@ function requireCsrf(req, session, res) {
 async function ownedProject(id, userId, executor = db) {
   const [rows] = await executor.execute('SELECT * FROM projects WHERE id = ? AND user_id = ?', [Number(id), userId]);
   return rows[0];
+}
+
+async function ownedWorkspaceDatabase(id, userId, executor) {
+  const [rows] = await executor.execute('SELECT * FROM website_databases WHERE id = ? AND user_id = ?', [Number(id), userId]);
+  return rows[0];
+}
+
+function workspaceDatabasePool(databaseRecord, database = databaseRecord.schema_name) {
+  const credentials = decryptCredentials(databaseRecord.credentials_encrypted);
+  if (databaseRecord.source === 'managed') return createManagedPool(database, credentials);
+  if (databaseRecord.source === 'external') return createExternalPool(credentials, database);
+  throw new Error('Unsupported database connection type.');
+}
+
+async function ownedWorkspaceTable(id, userId, executor) {
+  const [rows] = await executor.execute(
+    'SELECT t.*, d.user_id, d.source, d.host, d.port, d.schema_name, d.username, d.credentials_encrypted FROM website_database_tables t JOIN website_databases d ON d.id = t.database_id WHERE t.id = ? AND d.user_id = ?',
+    [Number(id), userId]
+  );
+  return rows[0];
+}
+
+function validateImportedRows(rows, columns) {
+  if (!Array.isArray(rows) || rows.length > 5000) return { error: 'Import must contain no more than 5,000 rows.' };
+  const result = [];
+  for (const row of rows) {
+    const data = Object.fromEntries(Object.entries(row || {}).filter(([key]) => key !== 'id'));
+    const validated = validateRow(data, columns);
+    if (validated.error) return validated;
+    const id = row?.id === undefined ? null : Number(row.id);
+    if (id !== null && (!Number.isSafeInteger(id) || id < 1)) return { error: 'Imported row IDs must be positive whole numbers.' };
+    result.push({ id, values: validated.values });
+  }
+  return { rows: result };
 }
 
 async function api(req, res, session, pathname, database = db) {
@@ -373,6 +422,403 @@ return json(res, duplicate ? 409 : 500, { error: duplicate ? 'An account with th
     return json(res, 201, { integration: rows[0] });
   }
 
+  if (pathname === '/api/data/databases' && req.method === 'GET') {
+    if (!requireUser(session, res)) return;
+    const [rows] = await db.execute(
+      'SELECT d.id, d.project_id, p.name AS project_name, d.name, d.source, d.host, d.port, d.schema_name, d.username, d.created_at FROM website_databases d JOIN projects p ON p.id = d.project_id WHERE d.user_id = ? ORDER BY d.created_at DESC',
+      [session.userId]
+    );
+    return json(res, 200, { databases: rows });
+  }
+
+  if (pathname === '/api/data/databases' && req.method === 'POST') {
+    if (!requireUser(session, res)) return;
+    const body = await readBody(req);
+    const projectId = Number(body.projectId);
+    const name = textField(body.name, 100);
+    const source = body.source;
+    const [projects] = await db.execute('SELECT id FROM projects WHERE id = ? AND user_id = ?', [projectId, session.userId]);
+    if (!projects[0] || name.length < 2 || !['managed', 'external'].includes(source)) {
+      return json(res, 422, { error: 'Choose a project, display name, and supported database hosting type.' });
+    }
+
+    let host;
+    let port;
+    let schemaName;
+    let username;
+    let credentialsEncrypted;
+    if (source === 'managed') {
+      try {
+        const target = hostedMySqlConnectionOptions();
+        host = target.host;
+        port = target.port;
+        schemaName = `cwdb_${session.userId}_${crypto.randomBytes(6).toString('hex')}`;
+        username = `cw_${session.userId}_${crypto.randomBytes(4).toString('hex')}`;
+        const password = crypto.randomBytes(32).toString('hex');
+        const accountHost = process.env.HOSTED_MYSQL_USER_HOST || 'localhost';
+        const credentials = { host, port, username, password };
+        credentialsEncrypted = encryptCredentials(credentials);
+        const provisioner = createManagedPool();
+        let schemaCreated = false;
+        let userCreated = false;
+        try {
+          await provisioner.query(`CREATE DATABASE ${quoteIdentifier(schemaName)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+          schemaCreated = true;
+          await provisioner.query('CREATE USER ?@? IDENTIFIED BY ?', [username, accountHost, password]);
+          userCreated = true;
+          await provisioner.query(
+            `GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX ON ${quoteIdentifier(schemaName)}.* TO ?@?`,
+            [username, accountHost]
+          );
+        } catch (error) {
+          if (userCreated) {
+            try { await provisioner.query('DROP USER IF EXISTS ?@?', [username, accountHost]); }
+            catch (cleanupError) { console.error(`Could not remove partially created hosted MySQL user: ${cleanupError.message}`); }
+          }
+          if (schemaCreated) {
+            try { await provisioner.query(`DROP DATABASE IF EXISTS ${quoteIdentifier(schemaName)}`); }
+            catch (cleanupError) { console.error(`Could not remove partially created hosted MySQL database: ${cleanupError.message}`); }
+          }
+          throw error;
+        } finally {
+          await provisioner.end();
+        }
+        const pool = createManagedPool(schemaName, credentials);
+        try { await pool.query('SELECT 1'); }
+        finally { await pool.end(); }
+      } catch (error) {
+        return json(res, 422, { error: `Could not create the CortexWeb-hosted MySQL database: ${error.message}` });
+      }
+    } else {
+      host = textField(body.host, 253).toLowerCase();
+      schemaName = String(body.schemaName || '').trim();
+      username = textField(body.username, 128);
+      const password = String(body.password || '');
+      port = Number(body.port || 3306);
+      if (!validIdentifier(schemaName) || !username || password.length < 1 || password.length > 500 || !Number.isInteger(port) || port < 1 || port > 65535) {
+        return json(res, 422, { error: 'Enter a valid MySQL database name, host, port, username, and password.' });
+      }
+      const credentials = { host, port, username, password };
+      try {
+        credentialsEncrypted = encryptCredentials(credentials);
+      } catch (error) {
+        return json(res, 503, { error: error.message });
+      }
+      let pool;
+      try {
+        const createDatabasePool = await createExternalPool(credentials);
+        try {
+          await createDatabasePool.query(`CREATE DATABASE IF NOT EXISTS ${quoteIdentifier(schemaName)} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+        } finally {
+          await createDatabasePool.end();
+        }
+        pool = await createExternalPool(credentials, schemaName);
+        await pool.query('SELECT 1');
+      } catch (error) {
+        return json(res, 422, { error: `Could not connect to MySQL or create the database: ${error.message}` });
+      } finally {
+        if (pool) await pool.end();
+      }
+    }
+
+    const [result] = await db.execute(
+      'INSERT INTO website_databases (user_id, project_id, name, source, host, port, schema_name, username, credentials_encrypted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [session.userId, projectId, name, source, host, port, schemaName, username, credentialsEncrypted]
+    );
+    await logActivity(session.userId, projectId, 'Website database created', name, db);
+    const [rows] = await db.execute(
+      'SELECT id, project_id, name, source, host, port, schema_name, username, created_at FROM website_databases WHERE id = ?',
+      [result.insertId]
+    );
+    return json(res, 201, { database: rows[0] });
+  }
+
+  const databaseTablesMatch = pathname.match(/^\/api\/data\/databases\/(\d+)\/tables$/);
+  if (databaseTablesMatch && req.method === 'GET') {
+    if (!requireUser(session, res)) return;
+    const databaseRecord = await ownedWorkspaceDatabase(databaseTablesMatch[1], session.userId, db);
+    if (!databaseRecord) return json(res, 404, { error: 'Database not found.' });
+    const [tables] = await db.execute(
+      'SELECT id, database_id, table_name, columns_json, created_at FROM website_database_tables WHERE database_id = ? ORDER BY table_name',
+      [databaseRecord.id]
+    );
+    return json(res, 200, { tables: tables.map((table) => ({ ...table, columns: JSON.parse(table.columns_json) })) });
+  }
+
+  if (databaseTablesMatch && req.method === 'POST') {
+    if (!requireUser(session, res)) return;
+    const databaseRecord = await ownedWorkspaceDatabase(databaseTablesMatch[1], session.userId, db);
+    if (!databaseRecord) return json(res, 404, { error: 'Database not found.' });
+    const body = await readBody(req);
+    const tableName = String(body.name || '').trim();
+    const columnResult = validateColumns(body.columns);
+    if (!validIdentifier(tableName) || columnResult.error) return json(res, 422, { error: columnResult.error || 'Enter a valid table name.' });
+    let pool;
+    try {
+      pool = workspaceDatabasePool(databaseRecord);
+      await pool.query(createTableSql(tableName, columnResult.columns));
+    } catch (error) {
+      return json(res, 422, { error: `Could not create the MySQL table: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+    const [result] = await db.execute(
+      'INSERT INTO website_database_tables (database_id, table_name, columns_json) VALUES (?, ?, ?)',
+      [databaseRecord.id, tableName, JSON.stringify(columnResult.columns)]
+    );
+    const [rows] = await db.execute('SELECT id, database_id, table_name, columns_json, created_at FROM website_database_tables WHERE id = ?', [result.insertId]);
+    return json(res, 201, { table: { ...rows[0], columns: JSON.parse(rows[0].columns_json) } });
+  }
+
+  const databaseImportMatch = pathname.match(/^\/api\/data\/databases\/(\d+)\/import$/);
+  if (databaseImportMatch && req.method === 'POST') {
+    if (!requireUser(session, res)) return;
+    const databaseRecord = await ownedWorkspaceDatabase(databaseImportMatch[1], session.userId, db);
+    if (!databaseRecord) return json(res, 404, { error: 'Database not found.' });
+    const body = await readBody(req);
+    let tableName;
+    let columns;
+    let importedRows;
+    try {
+      if (String(body.format || '').toLowerCase() === 'sql') {
+        const schema = parseSqlExport(body.sql);
+        tableName = schema.tableName;
+        columns = schema.columns;
+        importedRows = importSql(body.sql, tableName, columns).map((row) => ({ values: Object.fromEntries(columns.map((column) => [column.name, row[column.name]])) }));
+      } else if (String(body.format || '').toLowerCase() === 'json') {
+        const dump = body.dump;
+        tableName = String(dump?.table || '').trim();
+        const schema = validateColumns(dump?.columns);
+        if (schema.error) return json(res, 422, { error: schema.error });
+        columns = schema.columns;
+        const data = validateImportedRows(dump?.rows, columns);
+        if (data.error) return json(res, 422, { error: data.error });
+        importedRows = data.rows.map(({ values }) => ({ values }));
+      } else {
+        return json(res, 422, { error: 'Import format must be JSON or SQL.' });
+      }
+      if (!validIdentifier(tableName)) return json(res, 422, { error: 'The import contains an invalid table name.' });
+      if (importedRows.length > 5000) return json(res, 422, { error: 'Import is limited to 5,000 rows.' });
+    } catch (error) {
+      return json(res, 422, { error: error.message });
+    }
+
+    let pool;
+    let createdTable = false;
+    let metadataId;
+    try {
+      pool = workspaceDatabasePool(databaseRecord);
+      await pool.query(createTableSql(tableName, columns));
+      createdTable = true;
+      const [result] = await db.execute(
+        'INSERT INTO website_database_tables (database_id, table_name, columns_json) VALUES (?, ?, ?)',
+        [databaseRecord.id, tableName, JSON.stringify(columns)]
+      );
+      metadataId = result.insertId;
+      if (importedRows.length) {
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
+          for (const row of importedRows) {
+            const names = columns.map((column) => column.name);
+            await connection.execute(
+              `INSERT INTO ${quoteIdentifier(tableName)} (${names.map(quoteIdentifier).join(', ')}) VALUES (${names.map(() => '?').join(', ')})`,
+              names.map((name) => row.values[name])
+            );
+          }
+          await connection.commit();
+        } catch (error) {
+          await connection.rollback();
+          throw error;
+        } finally {
+          connection.release();
+        }
+      }
+      createdTable = false;
+      metadataId = null;
+      await logActivity(session.userId, Number(databaseRecord.project_id), 'Website table imported', `${tableName} · ${importedRows.length} rows`, db);
+      return json(res, 201, { tableId: Number(metadataId), tableName, imported: importedRows.length });
+    } catch (error) {
+      if (metadataId) {
+        await db.execute('DELETE FROM website_database_tables WHERE id = ?', [metadataId]);
+      }
+      if (createdTable && pool) {
+        try {
+          await pool.query(`DROP TABLE IF EXISTS ${quoteIdentifier(tableName)}`);
+        } catch (cleanupError) {
+          console.error(`Could not clean up imported MySQL table ${tableName}: ${cleanupError.message}`);
+        }
+      }
+      return json(res, 502, { error: `MySQL table import failed: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+  }
+
+  const tableRowsMatch = pathname.match(/^\/api\/data\/tables\/(\d+)\/rows$/);
+  if (tableRowsMatch && ['GET', 'POST'].includes(req.method)) {
+    if (!requireUser(session, res)) return;
+    const table = await ownedWorkspaceTable(tableRowsMatch[1], session.userId, db);
+    if (!table) return json(res, 404, { error: 'Table not found.' });
+    const columns = JSON.parse(table.columns_json);
+    let pool;
+    try {
+      const credentials = decryptCredentials(table.credentials_encrypted);
+      pool = workspaceDatabasePool(table);
+      if (req.method === 'GET') {
+        const [rows] = await pool.query(`SELECT * FROM ${quoteIdentifier(table.table_name)} ORDER BY id DESC LIMIT 500`);
+        return json(res, 200, { table: { id: table.id, name: table.table_name, columns }, rows });
+      }
+      const body = await readBody(req);
+      const validated = validateRow(body.values, columns);
+      if (validated.error) return json(res, 422, { error: validated.error });
+      const names = columns.map((column) => column.name);
+      const [result] = await pool.execute(
+        `INSERT INTO ${quoteIdentifier(table.table_name)} (${names.map(quoteIdentifier).join(', ')}) VALUES (${names.map(() => '?').join(', ')})`,
+        names.map((name) => validated.values[name])
+      );
+      return json(res, 201, { rowId: Number(result.insertId) });
+    } catch (error) {
+      return json(res, 502, { error: `MySQL table operation failed: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+  }
+
+  const tableRowUpdateMatch = pathname.match(/^\/api\/data\/tables\/(\d+)\/rows\/(\d+)$/);
+  if (tableRowUpdateMatch && req.method === 'PUT') {
+    if (!requireUser(session, res)) return;
+    const table = await ownedWorkspaceTable(tableRowUpdateMatch[1], session.userId, db);
+    if (!table) return json(res, 404, { error: 'Table not found.' });
+    const body = await readBody(req);
+    const columns = JSON.parse(table.columns_json);
+    const validated = validateRow(body.values, columns);
+    if (validated.error) return json(res, 422, { error: validated.error });
+    let pool;
+    try {
+      pool = workspaceDatabasePool(table);
+      const names = columns.map((column) => column.name);
+      const [result] = await pool.execute(
+        `UPDATE ${quoteIdentifier(table.table_name)} SET ${names.map((name) => `${quoteIdentifier(name)} = ?`).join(', ')} WHERE id = ?`,
+        [...names.map((name) => validated.values[name]), Number(tableRowUpdateMatch[2])]
+      );
+      if (!result.affectedRows) {
+        const [rows] = await pool.execute(`SELECT id FROM ${quoteIdentifier(table.table_name)} WHERE id = ?`, [Number(tableRowUpdateMatch[2])]);
+        if (!rows[0]) return json(res, 404, { error: 'Row not found.' });
+      }
+      return json(res, 200, { updated: true });
+    } catch (error) {
+      return json(res, 502, { error: `MySQL row update failed: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+  }
+
+  const tableRowDeleteMatch = pathname.match(/^\/api\/data\/tables\/(\d+)\/rows\/(\d+)$/);
+  if (tableRowDeleteMatch && req.method === 'DELETE') {
+    if (!requireUser(session, res)) return;
+    const table = await ownedWorkspaceTable(tableRowDeleteMatch[1], session.userId, db);
+    if (!table) return json(res, 404, { error: 'Table not found.' });
+    let pool;
+    try {
+      pool = workspaceDatabasePool(table);
+      await pool.execute(`DELETE FROM ${quoteIdentifier(table.table_name)} WHERE id = ?`, [Number(tableRowDeleteMatch[2])]);
+      return empty(res);
+    } catch (error) {
+      return json(res, 502, { error: `MySQL row delete failed: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+  }
+
+  const tableExportMatch = pathname.match(/^\/api\/data\/tables\/(\d+)\/export$/);
+  if (tableExportMatch && req.method === 'GET') {
+    if (!requireUser(session, res)) return;
+    const table = await ownedWorkspaceTable(tableExportMatch[1], session.userId, db);
+    if (!table) return json(res, 404, { error: 'Table not found.' });
+    const columns = JSON.parse(table.columns_json);
+    let pool;
+    try {
+      pool = workspaceDatabasePool(table);
+      const [rows] = await pool.query(`SELECT * FROM ${quoteIdentifier(table.table_name)} ORDER BY id LIMIT 5001`);
+      if (rows.length > 5000) return json(res, 413, { error: 'Export is limited to 5,000 rows at a time.' });
+      const format = new URL(req.url, 'http://localhost').searchParams.get('format') || 'json';
+      if (format === 'sql') {
+        const content = exportSql(table.table_name, columns, rows);
+        if (Buffer.byteLength(content, 'utf8') > 900_000) return json(res, 413, { error: 'Export is limited to 900 KB at a time. Export fewer rows or reduce the row data.' });
+        res.writeHead(200, {
+          'content-type': 'text/plain; charset=utf-8',
+          'content-disposition': `attachment; filename="${table.table_name}.sql"`,
+          'cache-control': 'no-store',
+        });
+        return res.end(content);
+      }
+      if (format !== 'json') return json(res, 422, { error: 'Choose JSON or SQL export.' });
+      const content = JSON.stringify({ table: table.table_name, columns, rows }, null, 2);
+      if (Buffer.byteLength(content, 'utf8') > 900_000) return json(res, 413, { error: 'Export is limited to 900 KB at a time. Export fewer rows or reduce the row data.' });
+      res.writeHead(200, {
+        'content-type': 'application/json; charset=utf-8',
+        'content-disposition': `attachment; filename="${table.table_name}.json"`,
+        'cache-control': 'no-store',
+      });
+      return res.end(content);
+    } catch (error) {
+      return json(res, 502, { error: `MySQL export failed: ${error.message}` });
+    } finally {
+      if (pool) await pool.end();
+    }
+  }
+
+  const tableImportMatch = pathname.match(/^\/api\/data\/tables\/(\d+)\/import$/);
+  if (tableImportMatch && req.method === 'POST') {
+    if (!requireUser(session, res)) return;
+    const table = await ownedWorkspaceTable(tableImportMatch[1], session.userId, db);
+    if (!table) return json(res, 404, { error: 'Table not found.' });
+    const body = await readBody(req);
+    const columns = JSON.parse(table.columns_json);
+    let importedRows;
+    try {
+      const format = String(body.format || '').toLowerCase();
+      if (format === 'sql') {
+        importedRows = importSql(body.sql, table.table_name, columns).map((row) => ({ id: null, values: Object.fromEntries(columns.map((column) => [column.name, row[column.name]])) }));
+      } else if (format === 'json') {
+        const result = validateImportedRows(body.rows, columns);
+        if (result.error) return json(res, 422, { error: result.error });
+        importedRows = result.rows;
+      } else {
+        return json(res, 422, { error: 'Import format must be JSON or SQL.' });
+      }
+      if (importedRows.length > 5000) return json(res, 422, { error: 'Import is limited to 5,000 rows.' });
+      importedRows = importedRows.map(({ values }) => ({ id: null, values }));
+    } catch (error) {
+      return json(res, 422, { error: error.message });
+    }
+    let pool;
+    let connection;
+    try {
+      pool = workspaceDatabasePool(table);
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+      const columnsWithId = ['id', ...columns.map((column) => column.name)];
+      for (const row of importedRows) {
+        const names = row.id ? columnsWithId : columns.map((column) => column.name);
+        const values = row.id ? [row.id, ...columns.map((column) => row.values[column.name])] : columns.map((column) => row.values[column.name]);
+        await connection.execute(
+          `INSERT INTO ${quoteIdentifier(table.table_name)} (${names.map(quoteIdentifier).join(', ')}) VALUES (${names.map(() => '?').join(', ')})`,
+          values
+        );
+      }
+      await connection.commit();
+      return json(res, 200, { imported: importedRows.length });
+    } catch (error) {
+      if (connection) await connection.rollback();
+      return json(res, 502, { error: `MySQL import failed: ${error.message}` });
+    } finally {
+      connection?.release();
+      if (pool) await pool.end();
+    }
+  }
+
   if (pathname === '/api/submissions' && req.method === 'GET') {
     if (!requireUser(session, res)) return;
     const [rows] = await db.execute('SELECT s.id, s.project_id, p.name AS project_name, s.form_type, s.name, s.email, s.message, s.created_at FROM submissions s JOIN projects p ON p.id = s.project_id WHERE p.user_id = ? ORDER BY s.created_at DESC LIMIT 300', [session.userId]);
@@ -455,7 +901,12 @@ async function requestHandler(req, res) {
 
   return fs.createReadStream(filePath).pipe(res);
 }
-    const filePath = path.resolve(root, pathname === '/' ? 'index.html' : `.${pathname}`);
+    if (['/', '/register', '/connect-database', '/database'].includes(pathname)) {
+      const filePath = path.join(root, 'index.html');
+      res.writeHead(200, { 'content-type': mimeTypes['.html'] });
+      return fs.createReadStream(filePath).pipe(res);
+    }
+    const filePath = path.resolve(root, `.${pathname}`);
     if ((filePath !== root && !filePath.startsWith(`${root}${path.sep}`)) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return json(res, 404, { error: 'Not found.' });
     res.writeHead(200, { 'content-type': mimeTypes[path.extname(filePath)] || 'application/octet-stream' });
     return fs.createReadStream(filePath).pipe(res);

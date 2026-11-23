@@ -114,6 +114,20 @@ test('API requests are dispatched through the HTTP request handler', async () =>
   assert.ok(JSON.parse(res.body).csrfToken);
 });
 
+test('database workspace endpoints require authentication and enforce ownership', async () => {
+  const database = { execute: async () => [[]] };
+  const unauthenticated = await callApi(database, 'GET', '/api/data/databases', undefined, null);
+  assert.equal(unauthenticated.statusCode, 401);
+
+  const missingDatabase = await callApi(database, 'GET', '/api/data/databases/41/tables');
+  assert.equal(missingDatabase.statusCode, 404);
+  assert.equal(missingDatabase.payload.error, 'Database not found.');
+
+  const missingTable = await callApi(database, 'GET', '/api/data/tables/9/rows');
+  assert.equal(missingTable.statusCode, 404);
+  assert.equal(missingTable.payload.error, 'Table not found.');
+});
+
 test('saving a project preserves its sections through authenticated and public loads', async () => {
   const original = { builderPages: [{ name: 'Home', sections: [{ type: 'hero', content: { heading: 'Saved design' } }] }] };
   const database = projectDatabase(original);
