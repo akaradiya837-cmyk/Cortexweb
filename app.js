@@ -2,6 +2,13 @@ let projects = JSON.parse(localStorage.getItem('cortexweb_projects') || 'null') 
 let connections = JSON.parse(localStorage.getItem('cortexweb_connections') || 'null') || [];
 let activity = JSON.parse(localStorage.getItem('cortexweb_activity') || 'null') || [];
 let submissions = [];
+let websiteDatabases = [];
+let activeWorkspaceDatabase = null;
+let activeWorkspaceTables = [];
+let activeWorkspaceTable = null;
+let activeWorkspaceRows = [];
+let editingWorkspaceRowId = null;
+let importAsNewWorkspaceTable = false;
 let backendEnabled = false;
 let csrfToken = null;
 let backendUser = null;
@@ -336,22 +343,223 @@ async function loadLeads() {
   finally { button.disabled = false; button.textContent = '↻ Refresh'; }
 }
 function renderConnections() {
-  $('#connectionMetric').textContent = connections.length; $('#connectionSummary').textContent = `${connections.length} connections across ${new Set(connections.map((c) => c.project)).size} projects.`;
-  const query = ($('#connectionSearch')?.value || '').toLowerCase();
-  $('#connectionList').innerHTML = connections.filter((c) => `${c.name} ${c.project} ${c.type}`.toLowerCase().includes(query)).map((c) => `<div class="connection-row"><div class="connection-name"><span class="db-icon">⌘</span><span><strong>${escapeHtml(c.name)}</strong><small>${escapeHtml(c.project)}</small></span></div><span>${escapeHtml(c.type)}</span><span class="env">● ${escapeHtml(c.environment)}</span><span>Updated today</span><button class="icon-button more" title="More options" aria-label="Connection actions">...</button></div>`).join('');
+  $('#connectionMetric').textContent = websiteDatabases.length;
+  $('#connectionSummary').textContent = `${websiteDatabases.length} MySQL database${websiteDatabases.length === 1 ? '' : 's'} configured.`;
+  $('#connectionList').innerHTML = !backendEnabled
+    ? '<p class="database-empty">Start the Node server and sign in to create a MySQL database.</p>'
+    : websiteDatabases.length
+      ? websiteDatabases.map((database) => `<button class="database-card open-workspace-database" data-database-id="${Number(database.id)}"><span class="db-icon">⌘</span><span><strong>${escapeHtml(database.name)}</strong><small>${escapeHtml(database.project_name)} · ${database.source === 'managed' ? 'CortexWeb hosted' : 'External MySQL'} · ${escapeHtml(database.schema_name)} @ ${escapeHtml(database.host)}</small></span><span class="database-open">Open tables →</span></button>`).join('')
+      : '<p class="database-empty">No databases yet. Create a MySQL database to start adding tables.</p>';
+  $$('.open-workspace-database').forEach((button) => button.addEventListener('click', () => openWorkspaceDatabase(Number(button.dataset.databaseId))));
+}
+async function loadWorkspaceDatabases() {
+  if (!backendEnabled) { renderConnections(); return; }
+  $('#connectionList').innerHTML = '<p class="database-empty">Loading MySQL databases…</p>';
+  try {
+    const result = await apiRequest('/api/data/databases');
+    websiteDatabases = result.databases;
+    renderConnections();
+  } catch (error) {
+    $('#connectionList').innerHTML = `<p class="database-empty">${escapeHtml(error.message)}</p>`;
+  }
+}
+async function openWorkspaceDatabase(databaseId) {
+  try {
+    const selected = websiteDatabases.find((database) => Number(database.id) === databaseId);
+    if (!selected) throw new Error('Database not found. Refresh the database list and try again.');
+    const result = await apiRequest(`/api/data/databases/${databaseId}/tables`);
+    activeWorkspaceDatabase = selected;
+    activeWorkspaceTables = result.tables;
+    activeWorkspaceTable = null;
+    editingWorkspaceRowId = null;
+    $('#databaseListPanel').hidden = true;
+    $('#databaseWorkspace').hidden = false;
+    $('#activeDatabaseName').textContent = selected.name;
+    $('#activeDatabaseInfo').textContent = `${selected.project_name} · ${selected.source === 'managed' ? 'CortexWeb hosted' : 'External MySQL'} · ${selected.schema_name} on ${selected.host}`;
+    $('#databaseTableDetail').hidden = true;
+    $('#databaseTables').innerHTML = activeWorkspaceTables.length
+      ? activeWorkspaceTables.map((table) => `<button class="outline-button database-table-button" data-table-id="${Number(table.id)}">${escapeHtml(table.table_name)}</button>`).join('')
+      : '<p class="database-empty">No tables yet. Create a table, then add rows or import data.</p>';
+    $$('.database-table-button').forEach((button) => button.addEventListener('click', () => openWorkspaceTable(Number(button.dataset.tableId))));
+    if (activeWorkspaceTables.length) await openWorkspaceTable(Number(activeWorkspaceTables[0].id));
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+async function openWorkspaceTable(tableId) {
+  try {
+    const result = await apiRequest(`/api/data/tables/${tableId}/rows`);
+    activeWorkspaceTable = result.table;
+    activeWorkspaceRows = result.rows;
+    editingWorkspaceRowId = null;
+    $('#databaseTableDetail').hidden = false;
+    $('#activeTableName').textContent = activeWorkspaceTable.name;
+    $('#activeTableSchema').textContent = `${activeWorkspaceTable.columns.map((column) => `${column.name} ${column.type}`).join(' · ')} · Showing latest 500 rows`;
+    $('#databaseRowsHead').innerHTML = `<tr><th>ID</th>${activeWorkspaceTable.columns.map((column) => `<th>${escapeHtml(column.name)}</th>`).join('')}<th></th></tr>`;
+    $('#databaseRowsBody').innerHTML = activeWorkspaceRows.length
+      ? activeWorkspaceRows.map((row) => `<tr><td>${Number(row.id)}</td>${activeWorkspaceTable.columns.map((column) => `<td>${escapeHtml(row[column.name] ?? '')}</td>`).join('')}<td><button class="outline-button edit-data-row" data-row-id="${Number(row.id)}">Edit</button> <button class="outline-button delete-data-row" data-row-id="${Number(row.id)}">Delete</button></td></tr>`).join('')
+      : `<tr><td colspan="${activeWorkspaceTable.columns.length + 2}">No rows yet. Add one or import JSON / SQL.</td></tr>`;
+    $('#databaseRowForm').innerHTML = `${activeWorkspaceTable.columns.map((column) => {
+      const inputType = column.type === 'INT' || column.type === 'DECIMAL' ? 'number' : column.type === 'DATE' ? 'date' : 'text';
+      const extra = column.type === 'DECIMAL' ? ' step="0.01"' : column.type === 'INT' ? ' step="1"' : '';
+      return `<label>${escapeHtml(column.name)} <small>${escapeHtml(column.type)}</small><input name="${escapeHtml(column.name)}" type="${inputType}"${extra} /></label>`;
+    }).join('')}<button class="primary-button" type="submit">＋ Add row</button>`;
+    $$('.edit-data-row').forEach((button) => button.addEventListener('click', () => {
+      const row = activeWorkspaceRows.find((item) => Number(item.id) === Number(button.dataset.rowId));
+      if (!row) return;
+      editingWorkspaceRowId = Number(row.id);
+      activeWorkspaceTable.columns.forEach((column) => { $('#databaseRowForm').elements.namedItem(column.name).value = row[column.name] ?? ''; });
+      $('#databaseRowForm button[type="submit"]').textContent = 'Save changes';
+      $('#databaseRowForm').insertAdjacentHTML('beforeend', '<button class="outline-button cancel-row-edit" type="button">Cancel</button>');
+      $('.cancel-row-edit').addEventListener('click', () => openWorkspaceTable(tableId));
+    }));
+    $$('.delete-data-row').forEach((button) => button.addEventListener('click', async () => {
+      try {
+        await apiRequest(`/api/data/tables/${tableId}/rows/${Number(button.dataset.rowId)}`, { method: 'DELETE' });
+        await openWorkspaceTable(tableId);
+      } catch (error) { showToast(error.message); }
+    }));
+    $$('.database-table-button').forEach((button) => button.classList.toggle('active', Number(button.dataset.tableId) === tableId));
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 function renderAll() { renderProjects(); renderActivity(); renderConnections(); renderDashboardMetrics(); renderLeads(); }
 function openModal(id) { $(id).classList.add('open'); }
 function closeModal(id) { $(id).classList.remove('open'); }
-function navigate(view) { if (document.body.classList.contains('user-mode') && !['builder', 'profile', 'leads'].includes(view)) return; $$('.page-view').forEach((section) => section.classList.remove('active-view')); $(`#${view}View`).classList.add('active-view'); $$('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === view)); $('#breadcrumbCurrent').textContent = view.charAt(0).toUpperCase() + view.slice(1); $('#sidebar').classList.remove('open'); }
+function navigate(view) { if (document.body.classList.contains('user-mode') && !['builder', 'profile', 'leads', 'connections'].includes(view)) return; $$('.page-view').forEach((section) => section.classList.remove('active-view')); $(`#${view}View`).classList.add('active-view'); $$('.nav-item').forEach((item) => item.classList.toggle('active', item.dataset.view === view)); $('#breadcrumbCurrent').textContent = view.charAt(0).toUpperCase() + view.slice(1); $('#sidebar').classList.remove('open'); if (view === 'connections') { activeWorkspaceDatabase = null; $('#databaseListPanel').hidden = false; $('#databaseWorkspace').hidden = true; loadWorkspaceDatabases(); } }
 $$('.nav-item, [data-view="projects"]').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.view || 'projects')));
 $('#menuToggle').addEventListener('click', () => $('#sidebar').classList.toggle('open'));
-$('#topNewProject').addEventListener('click', () => openModal('#projectModal')); $('#newProjectButton').addEventListener('click', () => openModal('#projectModal')); $('#newConnectionButton').addEventListener('click', () => { $('#connectionProject').innerHTML = projects.map((p) => `<option value="${Number(p.id)}">${escapeHtml(p.name)}</option>`).join(''); openModal('#connectionModal'); });
+$('#connectionsBack').addEventListener('click', () => navigate('builder'));
+$('#databaseBack').addEventListener('click', () => { activeWorkspaceDatabase = null; $('#databaseWorkspace').hidden = true; $('#databaseListPanel').hidden = false; });
+$('#newDataTableButton').addEventListener('click', () => { if (!activeWorkspaceDatabase) return; $('#dataTableForm').reset(); clearFormError($('#dataTableForm')); openModal('#dataTableModal'); });
+function updateDatabaseSourceFields() {
+  const external = $('#databaseSource').value === 'external';
+  $('#externalConnectionFields').hidden = !external;
+  $$('#externalConnectionFields input').forEach((input) => { input.required = external; });
+  $('#connectionModalCopy').textContent = external
+    ? 'Connect a public MySQL server with a trusted TLS certificate. Connection credentials are encrypted with the server key.'
+    : 'CortexWeb creates an isolated MySQL database and dedicated credentials. Hosted database provisioning must be configured on the server.';
+}
+$('#databaseSource').addEventListener('change', updateDatabaseSourceFields);
+$('#newConnectionButton').addEventListener('click', () => {
+  if (!backendEnabled) { showToast('Sign in through the Node server to create a database.'); return; }
+  $('#connectionProject').innerHTML = projects.map((project) => `<option value="${Number(project.id)}">${escapeHtml(project.name)}</option>`).join('');
+  $('#connectionForm').reset();
+  updateDatabaseSourceFields();
+  $('#connectionForm [name="port"]').value = '3306';
+  clearFormError($('#connectionForm'));
+  openModal('#connectionModal');
+});
+$('#topNewProject').addEventListener('click', () => openModal('#projectModal')); $('#newProjectButton').addEventListener('click', () => openModal('#projectModal'));
+$('#importTableButton').addEventListener('click', () => { importAsNewWorkspaceTable = true; $('#databaseImportFile').click(); });
+$('#importDataButton').addEventListener('click', () => { importAsNewWorkspaceTable = false; $('#databaseImportFile').click(); });
+$('#databaseImportFile').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file || (importAsNewWorkspaceTable ? !activeWorkspaceDatabase : !activeWorkspaceTable)) return;
+  try {
+    const text = await file.text();
+    const isSql = file.name.toLowerCase().endsWith('.sql');
+    if (importAsNewWorkspaceTable) {
+      const payload = isSql ? { format: 'sql', sql: text } : { format: 'json', dump: JSON.parse(text) };
+      const databaseId = Number(activeWorkspaceDatabase.id);
+      const result = await apiRequest(`/api/data/databases/${databaseId}/import`, { method: 'POST', body: JSON.stringify(payload) });
+      await openWorkspaceDatabase(databaseId);
+      await openWorkspaceTable(Number(result.tableId));
+      showToast(`Imported table ${result.tableName} with ${result.imported} rows.`);
+    } else {
+      const payload = isSql
+        ? { format: 'sql', sql: text }
+        : { format: 'json', rows: (() => { const imported = JSON.parse(text); return Array.isArray(imported) ? imported : imported.rows; })() };
+      const tableId = Number(activeWorkspaceTable.id);
+      const result = await apiRequest(`/api/data/tables/${tableId}/import`, { method: 'POST', body: JSON.stringify(payload) });
+      await openWorkspaceTable(tableId);
+      showToast(`Imported ${result.imported} rows.`);
+    }
+  } catch (error) {
+    showToast(`Import failed: ${error.message}`);
+  } finally {
+    importAsNewWorkspaceTable = false;
+    event.target.value = '';
+  }
+});
+async function downloadTableExport(format) {
+  if (!activeWorkspaceTable) return;
+  try {
+    const response = await fetch(`/api/data/tables/${Number(activeWorkspaceTable.id)}/export?format=${format}`, { credentials: 'same-origin' });
+    if (!response.ok) {
+      const result = await response.json();
+      throw new Error(result.error || 'Export failed.');
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${activeWorkspaceTable.name}.${format}`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    showToast(`Export failed: ${error.message}`);
+  }
+}
+$('#exportJsonButton').addEventListener('click', () => downloadTableExport('json'));
+$('#exportSqlButton').addEventListener('click', () => downloadTableExport('sql'));
+$('#databaseRowForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!activeWorkspaceTable) return;
+  const values = Object.fromEntries([...new FormData(event.target)].map(([name, value]) => [name, value === '' ? null : value]));
+  try {
+    const wasEditing = Boolean(editingWorkspaceRowId);
+    const rowUrl = `/api/data/tables/${Number(activeWorkspaceTable.id)}/rows${editingWorkspaceRowId ? `/${editingWorkspaceRowId}` : ''}`;
+    await apiRequest(rowUrl, { method: editingWorkspaceRowId ? 'PUT' : 'POST', body: JSON.stringify({ values }) });
+    editingWorkspaceRowId = null;
+    await openWorkspaceTable(Number(activeWorkspaceTable.id));
+    event.target.reset();
+    showToast(wasEditing ? 'Row updated.' : 'Row added.');
+  } catch (error) {
+    showFormError(event.target, error.message);
+  }
+});
 $$('[data-close]').forEach((button) => button.addEventListener('click', () => closeModal(`#${button.dataset.close}`)));
 $$('.modal-backdrop').forEach((backdrop) => backdrop.addEventListener('click', (event) => { if (event.target === backdrop) backdrop.classList.remove('open'); }));
 $('#projectForm').addEventListener('submit', async (event) => { event.preventDefault(); clearFormError(event.target); const data = Object.fromEntries(new FormData(event.target)); try { if (backendEnabled) { const result = await apiRequest('/api/projects', { method: 'POST', body: JSON.stringify(data) }); projects.unshift(backendProject(result.project)); await hydrateBackend(); } else { const initials = data.client.split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase(); projects.unshift({ id: Date.now(), name: data.name, client: data.client, type: data.type, status: 'In progress', initials, color: 'purple', updated: 'Just now', brief: data.brief }); activity.unshift({ icon: '▣', title: 'New project created', detail: `${data.name} · by Anand`, time: 'Just now' }); save(); renderAll(); } closeModal('#projectModal'); event.target.reset(); navigate('projects'); showToast('Project created successfully.'); } catch (error) { showFormError(event.target, error.message); } });
-$('#connectionForm').addEventListener('submit', async (event) => { event.preventDefault(); clearFormError(event.target); const data = Object.fromEntries(new FormData(event.target)); try { if (backendEnabled) { await apiRequest('/api/integrations', { method: 'POST', body: JSON.stringify({ ...data, projectId: Number(data.project) }) }); await hydrateBackend(); } else { const project = projects.find((item) => item.id === Number(data.project)); connections.unshift({ id: Date.now(), name: data.name, project: project?.name || 'Project', type: data.type, environment: data.environment, status: 'Demo integration' }); activity.unshift({ icon: '⌘', title: 'Demo integration added', detail: `${data.name} · ${data.type}`, time: 'Just now' }); save(); renderAll(); } closeModal('#connectionModal'); event.target.reset(); navigate('connections'); showToast('Integration record added.'); } catch (error) { showFormError(event.target, error.message); } });
-$('#projectSearch').addEventListener('input', renderProjects); $('#connectionSearch').addEventListener('input', renderConnections); $('#clientToast').addEventListener('click', () => showToast('Client directory is ready for the next step.'));
+$('#connectionForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  clearFormError(event.target);
+  if (!backendEnabled) { showFormError(event.target, 'A server-backed account is required to create a MySQL database.'); return; }
+  const data = Object.fromEntries(new FormData(event.target));
+  data.projectId = Number(data.projectId);
+  if (data.source === 'external') data.port = Number(data.port);
+  else {
+    for (const field of ['host', 'port', 'schemaName', 'username', 'password']) delete data[field];
+  }
+  try {
+    await apiRequest('/api/data/databases', { method: 'POST', body: JSON.stringify(data) });
+    closeModal('#connectionModal');
+    event.target.reset();
+    await loadWorkspaceDatabases();
+    showToast(data.source === 'managed' ? 'CortexWeb-hosted MySQL database created.' : 'External MySQL database connected.');
+  } catch (error) {
+    showFormError(event.target, error.message);
+  }
+});
+$('#dataTableForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  clearFormError(event.target);
+  if (!activeWorkspaceDatabase) return;
+  const form = Object.fromEntries(new FormData(event.target));
+  let columns;
+  try { columns = JSON.parse(form.columns); } catch { showFormError(event.target, 'Columns must be valid JSON.'); return; }
+  try {
+    await apiRequest(`/api/data/databases/${Number(activeWorkspaceDatabase.id)}/tables`, { method: 'POST', body: JSON.stringify({ name: form.name, columns }) });
+    closeModal('#dataTableModal');
+    await openWorkspaceDatabase(Number(activeWorkspaceDatabase.id));
+    showToast('Table created.');
+  } catch (error) {
+    showFormError(event.target, error.message);
+  }
+});
+$('#projectSearch').addEventListener('input', renderProjects); $('#clientToast').addEventListener('click', () => showToast('Client directory is ready for the next step.'));
 setupLeadsView();
 renderAll();
 document.querySelector('.quote-panel small').textContent = 'CortexWeb field notes · 04';
@@ -673,7 +881,7 @@ async function deleteCurrentAccount() {
     backendUser = null;
     csrfToken = null;
     document.body.classList.remove('user-mode');
-    $('.auth-gate').classList.remove('hidden');
+    showAuthGate();
     navigate('builder');
     showToast('Account deleted.');
     setTimeout(() => window.location.reload(), 500);
@@ -681,13 +889,13 @@ async function deleteCurrentAccount() {
     showToast(error.message || 'Unable to delete account.');
   }
 }
-function logoutUser() { localStorage.removeItem('cortexweb_user'); document.body.classList.remove('user-mode'); $('.auth-gate').classList.remove('hidden'); navigate('builder'); showToast('You have been logged out.'); }
+function logoutUser() { localStorage.removeItem('cortexweb_user'); document.body.classList.remove('user-mode'); showAuthGate(); navigate('builder'); showToast('You have been logged out.'); }
 function addExportControls() {
   if (!document.body.classList.contains('user-mode') || $('#importTemplate')) return;
   const actions = $('.builder-actions');
   actions.insertAdjacentHTML('afterbegin', '<button class="outline-button" id="importTemplate">⇧ Upload template</button>');
   $('#importTemplate').addEventListener('click', () => $('#importFile').click());
-  if (!$('#profileButton')) { actions.insertAdjacentHTML('beforeend', '<button class="outline-button" id="builtinTemplatesButton">▦ Inbuilt templates</button><button class="outline-button" id="leadsButton">✉ Leads</button><button class="outline-button" id="profileButton">◯ Profile</button><button class="outline-button logout-button" id="logoutButton">↪ Log out</button>'); $('#builtinTemplatesButton').addEventListener('click', () => { setupTemplateModal(); renderBuilderBlocks(); $('#templateModal').classList.add('open'); }); $('#leadsButton').addEventListener('click', () => { navigate('leads'); loadLeads(); }); $('#profileButton').addEventListener('click', () => { renderProfile(); navigate('profile'); $('#profileView').classList.add('active-view'); }); $('#logoutButton').addEventListener('click', logoutUser); }
+  if (!$('#profileButton')) { actions.insertAdjacentHTML('beforeend', '<button class="outline-button" id="builtinTemplatesButton">▦ Inbuilt templates</button><button class="outline-button" id="databaseAccessButton">⌘ Database access</button><button class="outline-button" id="leadsButton">✉ Leads</button><button class="outline-button" id="profileButton">◯ Profile</button><button class="outline-button logout-button" id="logoutButton">↪ Log out</button>'); $('#builtinTemplatesButton').addEventListener('click', () => { setupTemplateModal(); renderBuilderBlocks(); $('#templateModal').classList.add('open'); }); $('#databaseAccessButton').addEventListener('click', () => navigate('connections')); $('#leadsButton').addEventListener('click', () => { navigate('leads'); loadLeads(); }); $('#profileButton').addEventListener('click', () => { renderProfile(); navigate('profile'); $('#profileView').classList.add('active-view'); }); $('#logoutButton').addEventListener('click', logoutUser); }
 }
 $('#closeHosted').addEventListener('click', () => $('#hostedModal').classList.remove('open'));
 $('#copyHostedUrl').addEventListener('click', async () => { const url = $('#hostedUrl').textContent; let copied = false; try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(url); copied = true; } } catch { copied = false; } if (!copied) { const helper = document.createElement('textarea'); helper.value = url; helper.setAttribute('readonly', ''); helper.style.position = 'fixed'; helper.style.opacity = '0'; document.body.appendChild(helper); helper.select(); copied = document.execCommand('copy'); helper.remove(); } showToast(copied ? 'Thank you for using CortexWeb. Hosted URL copied.' : 'Copy blocked by the browser. Select the URL to copy it.'); });
@@ -700,6 +908,14 @@ function applyRole(user) {
   let userProject = projects.find((project) => project.client === normalizedUser.name) || projects[0];
   if (!userProject) { const initials = (normalizedUser.name || 'User').split(' ').map((word) => word[0]).join('').slice(0, 2).toUpperCase(); userProject = { id: Date.now(), name: 'My first website', client: normalizedUser.name || 'Website owner', type: 'Marketing website', status: 'In progress', initials, color: 'purple', updated: 'Just now', brief: 'Your starter website is ready to customize.' }; projects = [userProject]; save(); renderAll(); }
   openBuilder(userProject.id);
+}
+function showAuthGate() {
+  $('.auth-gate').classList.remove('hidden');
+}
+function hideAuthGate() {
+  document.activeElement?.blur();
+  $('.auth-gate').classList.add('hidden');
+  window.scrollTo(0, 0);
 }
 function switchAuthView(view) {
   const tabs = $$('.auth-tab');
@@ -740,8 +956,12 @@ $('#registerForm').addEventListener('submit', async (event) => {
     backendEnabled = true;
     backendUser = result.user;
     await hydrateBackend();
-    $('.auth-gate').classList.add('hidden');
+    hideAuthGate();
     applyRole(backendUser);
+    if (sessionStorage.getItem('cortex_open_database') === '1') {
+      sessionStorage.removeItem('cortex_open_database');
+      navigate('connections');
+    }
     showToast('Email verified. Your workspace is ready.');
   } catch (error) {
     if (!backendEnabled && !registrationAwaitingOtp && error.message === 'Backend unavailable.') {
@@ -763,8 +983,25 @@ $('#registerForm').addEventListener('submit', async (event) => {
 });
 function setupAuth() {
   const panel = $('.auth-panel');
+  let route = location.pathname;
+  const requestedView = new URLSearchParams(location.search).get('view');
+  if (route === '/connect-database' || route === '/database' || requestedView === 'database') {
+    sessionStorage.setItem('cortex_open_database', '1');
+    window.history.replaceState({}, '', '/?view=register');
+    route = '/register';
+  } else if (requestedView === 'register') {
+    route = '/register';
+  }
+  if (route === '/') {
+    $('#authGate').classList.add('landing-mode');
+  } else {
+    $('#landingPage').remove();
+  }
+  if (route === '/connect-database' || route === '/database') {
+    window.history.replaceState({}, '', '/register');
+  }
   panel.querySelector('.auth-copy > p:last-child').textContent = 'Start with a blank page or choose a multi-page template. Edit each section and publish when your site is ready.';
-  $('#connectionModal .modal-copy').textContent = 'This records the intended database and environment only. Live connection testing is not included in this prototype.';
+  $('#connectionModalCopy').textContent = 'CortexWeb can host a dedicated database or connect to a MySQL server you provide.';
   panel.querySelector('.auth-copy').insertAdjacentHTML('afterend', '<div class="auth-tabs"><button type="button" class="auth-tab active" data-auth-view="login">Log in</button><button type="button" class="auth-tab" data-auth-view="register">Create account</button></div><form id="loginForm" class="register-form auth-form"><label>Email address<input name="email" type="email" required placeholder="you@example.com" /></label><label>Password<input name="password" type="password" required placeholder="Enter your password" /></label><label class="remember-field"><input name="remember" type="checkbox" /> Remember me</label><button class="primary-button auth-submit" type="submit">Log in <span>→</span></button><p class="auth-note">CortexWeb demo authentication stores only a browser-local password hash.</p></form>');
   $('#loginForm .auth-note').textContent = 'Accounts use server-side password hashing when the Node server is available.';
   const register = $('#registerForm');
@@ -774,9 +1011,12 @@ function setupAuth() {
   $('#resendRegisterOtp').style.display = 'none';
   $('#resendRegisterOtp').addEventListener('click', async () => { try { await sendRegistrationOtp(pendingRegistrationData); $('#registerOtpCode').value = ''; showToast('A new verification code was sent.'); } catch (error) { showAuthError(error.message); } });
   const login = $('#loginForm');
-  login.classList.add('visible');
-  $$('.auth-tab').forEach((tab) => tab.addEventListener('click', () => { const loginView = tab.dataset.authView === 'login'; $$('.auth-tab').forEach((item) => item.classList.toggle('active', item === tab)); login.classList.toggle('visible', loginView); register.classList.toggle('visible', !loginView); }));
-  login.addEventListener('submit', async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.target)); try { const result = await apiRequest('/api/auth/login', { method: 'POST', body: JSON.stringify(data) }); backendEnabled = true; backendUser = result.user; await hydrateBackend(); $('.auth-gate').classList.add('hidden'); applyRole(backendUser); showToast(`Welcome back, ${backendUser.name.split(' ')[0]}.`); } catch (error) { if (backendEnabled || error.message !== 'Backend unavailable.') { showAuthError(error.message); return; } const savedUser = JSON.parse(localStorage.getItem('cortexweb_user') || 'null'); const passwordHash = await hashPassword(data.password); if (!savedUser || !passwordHash || savedUser.email.toLowerCase() !== data.email.toLowerCase() || savedUser.passwordHash !== passwordHash) { showAuthError('Email or password is incorrect.'); return; } $('.auth-gate').classList.add('hidden'); applyRole(savedUser); showToast(`Welcome back, ${savedUser.name.split(' ')[0]}.`); } });
+  const registerRoute = route === '/register';
+  login.classList.toggle('visible', !registerRoute);
+  register.classList.toggle('visible', registerRoute);
+  $$('.auth-tab').forEach((tab) => tab.classList.toggle('active', tab.dataset.authView === (registerRoute ? 'register' : 'login')));
+  $$('.auth-tab').forEach((tab) => tab.addEventListener('click', () => switchAuthView(tab.dataset.authView)));
+  login.addEventListener('submit', async (event) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.target)); try { const result = await apiRequest('/api/auth/login', { method: 'POST', body: JSON.stringify(data) }); backendEnabled = true; backendUser = result.user; await hydrateBackend(); hideAuthGate(); applyRole(backendUser); if (sessionStorage.getItem('cortex_open_database') === '1') { sessionStorage.removeItem('cortex_open_database'); navigate('connections'); } showToast(`Welcome back, ${backendUser.name.split(' ')[0]}.`); } catch (error) { if (backendEnabled || error.message !== 'Backend unavailable.') { showAuthError(error.message); return; } const savedUser = JSON.parse(localStorage.getItem('cortexweb_user') || 'null'); const passwordHash = await hashPassword(data.password); if (!savedUser || !passwordHash || savedUser.email.toLowerCase() !== data.email.toLowerCase() || savedUser.passwordHash !== passwordHash) { showAuthError('Email or password is incorrect.'); return; } hideAuthGate(); applyRole(savedUser); if (sessionStorage.getItem('cortex_open_database') === '1') { sessionStorage.removeItem('cortex_open_database'); navigate('connections'); } showToast(`Welcome back, ${savedUser.name.split(' ')[0]}.`); } });
 }
 function showAuthError(message) { const form = $('.auth-form.visible') || $('#loginForm'); let note = form.querySelector('.auth-error'); if (!note) { note = document.createElement('p'); note.className = 'auth-error'; form.appendChild(note); } note.textContent = message; note.hidden = false; }
 setupAuth();
@@ -787,7 +1027,16 @@ async function initializeBackend() {
     csrfToken = (await csrfResponse.json()).csrfToken;
     const session = await apiRequest('/api/me');
     backendEnabled = true;
-    if (session.user) { backendUser = session.user; await hydrateBackend(); $('.auth-gate').classList.add('hidden'); applyRole(backendUser); }
+    if (session.user) {
+      backendUser = session.user;
+      await hydrateBackend();
+      hideAuthGate();
+      applyRole(backendUser);
+      if (sessionStorage.getItem('cortex_open_database') === '1') {
+        sessionStorage.removeItem('cortex_open_database');
+        navigate('connections');
+      }
+    }
   } catch (error) {
     backendEnabled = false;
     console.error('[CortexWeb] Backend initialization failed.', error);
@@ -805,7 +1054,7 @@ async function initializePublicSite() {
     activeProject = publishedProject;
     document.body.classList.remove('user-mode');
     document.body.classList.add('public-mode');
-    $('.auth-gate').classList.add('hidden');
+    hideAuthGate();
     openBuilder(publishedProject.id);
     showHostedSite();
   } catch (error) {
@@ -814,7 +1063,7 @@ async function initializePublicSite() {
     if (publishedProject) {
       document.body.classList.remove('user-mode');
       document.body.classList.add('public-mode');
-      $('.auth-gate').classList.add('hidden');
+      hideAuthGate();
       openBuilder(publishedProject.id);
       showHostedSite();
     }
